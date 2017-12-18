@@ -1,0 +1,4 @@
+*.key
+strategy.txt
+.cache/
+__pycache__/
