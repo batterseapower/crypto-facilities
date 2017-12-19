@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import pytz
 from typing import List, Tuple, Union
 
 # API calls are limited to 1 call every 0.1 seconds per IP address. If the API limit is
@@ -17,9 +18,11 @@ API_VERSION = '/api/v3/'
 
 def parse_time(s: str) -> datetime.datetime:
     # e.g. 2016-02-25T09:45:53.818Z
-    return datetime.datetime.strptime(s, '%Y-%m-%dT%H:%M:%S.%fZ')
+    t = datetime.datetime.strptime(s, '%Y-%m-%dT%H:%M:%S.%fZ')
+    return pytz.UTC.localize(t)
 
 def format_time(t: datetime.datetime) -> str:
+    t = t.astimezone(pytz.UTC) if t.tzinfo else t
     millisecond = t.microsecond // 1000
     return t.strftime('%Y-%m-%dT%H:%M:%S.') + '{0:3}'.format(millisecond) + 'Z'
 
@@ -116,6 +119,8 @@ def get_tickers():
     result = make_request('tickers')['tickers']
     return parse_time_fields(['lastTime'], result)
 
+OrderBook = collections.namedtuple('OrderBook', 'bids asks')
+
 # {
 #   “bids”: [
 #     [4213, 2000],
@@ -130,8 +135,14 @@ def get_tickers():
 # },
 #
 # Arrays are [price, size]. Bids have descending price, asks have ascending price.
-def get_order_book(symbol: str):
-    return make_request('orderbook', data=[('symbol', symbol)])['orderBook']
+def get_order_book(symbol: str) -> OrderBook:
+    result = make_request('orderbook', data=[('symbol', symbol)])['orderBook']
+    return OrderBook(
+        bids=result['bids'],
+        asks=result['asks'],
+    )
+
+Trade = collections.namedtuple('Trade', 'time trade_id price size')
 
 # [
 #   {
@@ -155,8 +166,16 @@ def get_trade_history(symbol: str, last_time: datetime.datetime = None):
     if last_time is not None:
         data.append(('lastTime', format_time(last_time)))
 
-    result = make_request('history', data=data)['history']
-    return parse_time_fields(['time'], result)
+    result = []
+    for struct in make_request('history', data=data)['history']:
+        result.append(Trade(
+            time=parse_time(struct['time']),
+            trade_id=struct['trade_id'],
+            price=struct['price'],
+            size=struct['size']
+        ))
+    
+    return result
 
 # {
 #   “cash”: {
@@ -349,7 +368,7 @@ def get_fill_history(key: APIKey, last_time: datetime.datetime = None):
         data.append(('lastFillTime', format_time(last_time)))
 
     result = make_request('fills', data=data, key=key)['fills']
-    return parse_time_fields(['fillTime'], result)
+    return parse_time_fields(['fillTime'], result) # FIXME: structured type (LimitOrderSpec, size, order_id, fill_time, fill_id)
 
 # [
 #   {
@@ -372,24 +391,47 @@ def get_positions(key: APIKey):
     result = make_request('openpositions', key=key)['openPositions']
     return parse_time_fields(['fillTime'], result)
 
+Money = collections.namedtuple('Money', 'currency amount')
+TransferStatus = collections.namedtuple('TransferStatus', 'received_time status transfer_id')
+
+def _get_transfer_data(money: Money, target_address: str):
+    return [
+        ('targetAddress', target_address),
+        ('currency',      money.currency),
+        ('amount',        money.amount)
+    ]
+
+def _get_money(struct: dict) -> Money:
+    return Money(
+        currency=struct['currency'],
+        amount=struct['amount'],
+    )
+
+def _get_transfer_status(struct: dict) -> TransferStatus:
+    return TransferStatus(
+        received_time=parse_time(struct['receivedTime']),
+        status=struct['status'],
+        transfer_id=struct.get('transfer_id'),
+    )
+
 # {
 #   “receivedTime”: “2016-02-25T09:47:01.000Z”,
 #   “status”: “accepted”,
 #   “transfer_id”: “b243cf7a-657d-488e-ab1c-cfb0f95362ba”,
 # }
-def withdraw(key: APIKey, target_address: str, currency: Union['xbt', 'xrp'], amount: float):
-    data = [('targetAddress', target_address), ('currency', currency), ('amount', amount)]
+def withdraw(key: APIKey, money: Money, target_address: str) -> TransferStatus:
+    data = _get_transfer_data(money, target_address)
     result = make_request('withdrawal', data=data, method='POST', key=key)
-    result, = parse_time_fields(['receivedTime'], [result])
-    return result
+    return _get_transfer_status(result)
+
+Transfer = collections.namedtuple('Transfer', 'money status target_address completed_time transaction_id')
 
 # [
 #   {
 #     “receivedTime”: “2016-01-28T07:09:42.000Z”,
 #     “completedTime”: “2016-01-28T08:26:46.000Z”,
 #     “status”: “processed”,
-#     “transfer_id”:
-#     “b243cf7a-657d-488e-ab1c-cfb0f95362ba”,
+#     “transfer_id”: “b243cf7a-657d-488e-ab1c-cfb0f95362ba”,
 #     “transaction_id”: “4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b”,
 #     “targetAddress”: “1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa”,
 #     “transferType”: “deposit”
@@ -398,10 +440,27 @@ def withdraw(key: APIKey, target_address: str, currency: Union['xbt', 'xrp'], am
 #   },
 #   ...
 # ]
-def get_transfer_history(key: APIKey, last_time: datetime.datetime = None):
+def get_transfer_history(key: APIKey, last_time: datetime.datetime = None) -> List[Transfer]:
     data = []
     if last_time is not None:
         data.append(('lastTransferTime', format_time(last_time)))
 
-    result = make_request('transfers', data=data, key=key)['transfers']
-    return parse_time_fields(['receivedTime', 'completedTime'], result)
+    transfers = []
+    for record in make_request('transfers', data=data, key=key)['transfers']:
+        if record['transferType'] == 'deposit':
+            assert 'targetAddress' not in record
+            target_address = None
+        elif record['transferType'] == 'withdrawal':
+            target_address = record['targetAddress']
+        else:
+            raise ValueError('Unknown type ' + record['transferType'])
+
+        transfers.append(Transfer(
+            money=_get_money(record),
+            status=_get_transfer_status(record),
+            target_address=target_address,
+            completed_time=parse_time(record['completedTime']),
+            transaction_id=record['transaction_id'],
+        ))
+
+    return transfers
