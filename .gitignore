@@ -2,3 +2,4 @@
 strategy.txt
 .cache/
 __pycache__/
+build/
