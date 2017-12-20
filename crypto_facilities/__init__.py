@@ -2,6 +2,7 @@ import collections
 import datetime
 import time
 import requests
+import threading
 import base64
 import hashlib
 import hmac
@@ -27,6 +28,7 @@ def format_time(t: datetime.datetime) -> str:
     return t.strftime('%Y-%m-%dT%H:%M:%S.') + '{0:3}'.format(millisecond) + 'Z'
 
 next_nonce = int(time.time() * 1000000)
+next_nonce_lock = threading.Lock()
 def make_request(path, data=[], method='GET', key=None):
     global next_nonce
 
@@ -35,8 +37,9 @@ def make_request(path, data=[], method='GET', key=None):
     else:
         post_data = '&'.join(k + '=' + v for k, v in data)
 
-        nonce = str(next_nonce)
-        next_nonce += 1
+        with next_nonce_lock:
+            nonce = str(next_nonce)
+            next_nonce += 1
 
         headers = {
             'APIKey': key.public,
@@ -389,7 +392,7 @@ def get_fill_history(key: APIKey, last_time: datetime.datetime = None):
 # ]
 def get_positions(key: APIKey):
     result = make_request('openpositions', key=key)['openPositions']
-    return parse_time_fields(['fillTime'], result)
+    return parse_time_fields(['fillTime'], result) # FIXME: structured type
 
 Money = collections.namedtuple('Money', 'currency amount')
 TransferStatus = collections.namedtuple('TransferStatus', 'received_time status transfer_id')
