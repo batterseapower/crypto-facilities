@@ -27,20 +27,30 @@ def format_time(t: datetime.datetime) -> str:
     millisecond = t.microsecond // 1000
     return t.strftime('%Y-%m-%dT%H:%M:%S.') + '{0:3}'.format(millisecond) + 'Z'
 
-next_nonce = int(time.time() * 1000000)
-next_nonce_lock = threading.Lock()
+last_nonce_lock = threading.Lock()
+last_nonce = None
 def make_request(path, data=[], method='GET', key=None):
-    global next_nonce
+    global last_nonce
 
     if key is None:
         headers = {}
     else:
         post_data = '&'.join(k + '=' + v for k, v in data)
 
-        with next_nonce_lock:
-            nonce = str(next_nonce)
-            next_nonce += 1
+        # The only requirement on the nonce is that it continuously
+        # increments. However, in order to try to support multiple processes
+        # concurrently using this library, we base the nonce on some
+        # shared state -- the current time. CryptoFacilities's system
+        # "tolerates nonces that are out of order for a brief period of time"
+        # so it doesn't matter if there is some slight mismatch between
+        # the processes.
+        with last_nonce_lock:
+            proposed_nonce = int(time.time() * 1000000)
+            if last_nonce is not None and last_nonce >= proposed_nonce:
+                proposed_nonce = last_nonce + 1
+            last_nonce = proposed_nonce
 
+        nonce = str(proposed_nonce)
         headers = {
             'APIKey': key.public,
             'Nonce': nonce,
